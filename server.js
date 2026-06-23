@@ -1,4 +1,5 @@
-import { startServer } from "@sena-labs/oz-mcp-server";
+import pkg from "@sena-labs/oz-mcp-server";
+const { startServer } = pkg;
 
 const PORT   = parseInt(process.env.PORT ?? "3847", 10);
 const HOST   = "0.0.0.0";           // must listen on all interfaces on Sevalla
