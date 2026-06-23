@@ -8,7 +8,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@sena-labs/oz-mcp-server": "latest"
+    "@sena-labs/oz-mcp-server": "latest",
+    "express": "^4.19.2",
+    "http-proxy-middleware": "^3.0.0"
   },
   "engines": {
     "node": ">=20"
