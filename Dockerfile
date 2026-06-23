@@ -1,9 +1,10 @@
 FROM node:22-slim
 
-# Install curl and gpg for the Warp apt repository
+# Install curl, gpg, and ca-certificates for the Warp apt repository
 RUN apt-get update && apt-get install -y \
     curl \
     gpg \
+    ca-certificates \
     --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
