@@ -1,0 +1,16 @@
+{
+  "name": "ozbridge-remote",
+  "version": "1.0.0",
+  "description": "OzBridge MCP server hosted on Sevalla",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@sena-labs/oz-mcp-server": "latest"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
