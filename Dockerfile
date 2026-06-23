@@ -1,12 +1,14 @@
 FROM node:22-slim
 
-# Install oz CLI via apt (official Warp repository)
+# Install curl and gpg for the Warp apt repository
 RUN apt-get update && apt-get install -y \
-    wget \
+    curl \
     gpg \
     --no-install-recommends \
- && rm -rf /var/lib/apt/lists/* \
- && wget -qO- https://releases.warp.dev/linux/keys/warp.asc | gpg --dearmor > warpdotdev.gpg \
+ && rm -rf /var/lib/apt/lists/*
+
+# Add Warp apt repository and install oz CLI
+RUN curl -fsSL https://releases.warp.dev/linux/keys/warp.asc | gpg --dearmor > warpdotdev.gpg \
  && install -D -o root -g root -m 644 warpdotdev.gpg /etc/apt/keyrings/warpdotdev.gpg \
  && sh -c 'echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/warpdotdev.gpg] https://releases.warp.dev/linux/deb stable main" > /etc/apt/sources.list.d/warpdotdev.list' \
  && rm warpdotdev.gpg \
