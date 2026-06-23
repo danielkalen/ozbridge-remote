@@ -95,6 +95,9 @@ app.post("/token", (req, res) => {
   if (cd.client_id && cd.client_id !== client_id) return res.status(400).json({ error: "invalid_grant", error_description: "client_id mismatch" });
 
   if (cd.code_challenge && cd.code_challenge_method === "S256") {
+    if (!code_verifier || typeof code_verifier !== "string") {
+      return res.status(400).json({ error: "invalid_grant", error_description: "Missing code_verifier" });
+    }
     const expected = createHash("sha256").update(code_verifier).digest("base64url");
     if (expected !== cd.code_challenge) return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
   }
