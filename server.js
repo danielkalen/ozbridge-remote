@@ -1,24 +1,24 @@
-import pkg from "@sena-labs/oz-mcp-server";
-const { startServer } = pkg;
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
-const PORT   = parseInt(process.env.PORT ?? "3847", 10);
-const HOST   = "0.0.0.0";           // must listen on all interfaces on Sevalla
-const TOKEN  = process.env.MCP_BEARER_TOKEN;
-
+const TOKEN = process.env.MCP_BEARER_TOKEN;
 if (!TOKEN) {
   console.error("ERROR: MCP_BEARER_TOKEN is required");
   process.exit(1);
 }
 
-// Start the OzBridge MCP server.
-// Config keys mirror the ozBridge.* VS Code settings documented in docs/MCP.md.
-await startServer({
-  port:            PORT,
-  bindAddress:     HOST,
-  bearerToken:     TOKEN,
-  ozPath:          process.env.OZ_PATH ?? "oz",
-  timeoutMs:       300_000,
-  maxOutputChars:  15_000,
+// Map our env vars to what the oz-mcp-server CLI expects.
+process.env.OZ_MCP_TOKEN = TOKEN;
+process.env.OZ_MCP_PORT = process.env.PORT ?? "3847";
+process.env.OZ_MCP_BIND = "0.0.0.0";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const serverPath = join(__dirname, "node_modules", ".bin", "oz-mcp-server");
+
+const child = spawn("node", [serverPath], {
+  stdio: "inherit",
+  env: process.env,
 });
 
-console.log(`OzBridge MCP server listening on http://${HOST}:${PORT}/sse`);
+child.on("exit", (code) => process.exit(code ?? 0));
