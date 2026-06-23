@@ -42,15 +42,16 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
     token_endpoint: `${baseUrl}/token`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
-    token_endpoint_auth_methods_supported: ["none"],
+    token_endpoint_auth_methods_supported: ["client_secret_post"],
     code_challenge_methods_supported: ["S256"],
     scopes_supported: ["mcp"],
-    client_id_metadata_document_supported: true,
   });
 });
 
+const BEARER_TOKEN = process.env.MCP_BEARER_TOKEN;
+
 app.get("/authorize", (req, res) => {
-  const { response_type, redirect_uri, code_challenge, code_challenge_method, state } = req.query;
+  const { response_type, client_id, redirect_uri, code_challenge, code_challenge_method, state } = req.query;
   if (response_type !== "code") return res.status(400).json({ error: "unsupported_response_type" });
 
   const allowed = "https://claude.ai/api/mcp/auth_callback";
@@ -61,7 +62,7 @@ app.get("/authorize", (req, res) => {
   const code = randomUUID();
   const token = randomUUID();
   codes.set(code, {
-    token, redirect_uri, code_challenge: code_challenge || null, code_challenge_method: code_challenge_method || null,
+    token, client_id: client_id || null, redirect_uri, code_challenge: code_challenge || null, code_challenge_method: code_challenge_method || null,
     expires: Date.now() + 10 * 60 * 1000,
   });
 
@@ -72,7 +73,7 @@ app.get("/authorize", (req, res) => {
 });
 
 app.post("/token", (req, res) => {
-  const { grant_type, code, redirect_uri, code_verifier } = req.body;
+  const { grant_type, code, redirect_uri, code_verifier, client_id, client_secret } = req.body;
 
   if (grant_type === "refresh_token") {
     const token = randomUUID();
@@ -82,11 +83,16 @@ app.post("/token", (req, res) => {
 
   if (grant_type !== "authorization_code") return res.status(400).json({ error: "unsupported_grant_type" });
 
+  if (!BEARER_TOKEN || client_secret !== BEARER_TOKEN) {
+    return res.status(401).json({ error: "invalid_client", error_description: "Invalid client_secret" });
+  }
+
   const cd = codes.get(code);
   if (!cd || cd.expires < Date.now()) return res.status(400).json({ error: "invalid_grant" });
   codes.delete(code);
 
   if (cd.redirect_uri && cd.redirect_uri !== redirect_uri) return res.status(400).json({ error: "invalid_grant" });
+  if (cd.client_id && cd.client_id !== client_id) return res.status(400).json({ error: "invalid_grant", error_description: "client_id mismatch" });
 
   if (cd.code_challenge && cd.code_challenge_method === "S256") {
     const expected = createHash("sha256").update(code_verifier).digest("base64url");
