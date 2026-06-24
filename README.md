@@ -65,7 +65,7 @@ Key components in `server.js`:
 
 - **OAuth layer** — `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `GET /authorize`, `POST /token`, and the `checkAuth` bearer middleware. All state (codes, tokens) is in-memory `Map`s.
 - **`/mcp` Streamable HTTP bridge** — registered before the catch-all proxy. For each `initialize` it creates a `@modelcontextprotocol/sdk` `Client` over an `SSEClientTransport` pointed at the internal `/sse`, plus a forwarding `Server` on a `StreamableHTTPServerTransport` that hands out `Mcp-Session-Id` values.
-- **Proxy-owned tools & REST endpoints** — the forwarding `Server` intercepts `tools/list` and `tools/call` to inject `oz_list_environments`, reimplement `oz_list_models` in-process (shelling out to `oz` directly), and reject `oz_agent_run` / `oz_agent_run_cloud` calls missing the required `model` (and `environment` for cloud) before forwarding to the internal server. `GET /environments` and `GET /models` expose the same listings as Bearer-authed JSON endpoints.
+- **Proxy-owned tools & REST endpoints** — the forwarding `Server` intercepts `tools/list` and `tools/call` to inject `oz_list_environments`, reimplement `oz_list_models` in-process (shelling out to `oz` directly), reject `oz_agent_run` / `oz_agent_run_cloud` calls missing the required `model` (and `environment` for cloud) before forwarding, implement `oz_run_followup` via the Warp public API, and add four focused read tools — `oz_run_status`, `oz_artifact_get`, `oz_run_transcript`, `oz_run_result` — backed by `oz run get`, `oz run conversation get`, and `oz artifact get`. `GET /environments`, `GET /models`, `GET /agent/runs/:runId/status|transcript|result`, `GET /agent/artifacts/:artifactUid`, and `POST /runs/:runId/followups` expose the same capabilities as Bearer-authed JSON endpoints.
 - **Catch-all SSE proxy** — `http-proxy-middleware` → `127.0.0.1:3848`, with `Authorization` stripped (the internal server is unauthenticated loopback). Keeps legacy SSE clients working.
 - **Child process** — `spawn("node", [oz-mcp-server])` with `OZ_MCP_PORT=3848`, `OZ_MCP_BIND=127.0.0.1`, inheriting `process.env` so `WARP_API_KEY` / `OZ_*` vars reach the `oz` CLI. If the child exits, the proxy exits too.
 
@@ -142,6 +142,10 @@ The metadata does **not** currently advertise a `registration_endpoint` (Dynamic
 | `GET` | `/environments` | Bearer | List cloud Oz environments: `{"count":N,"environments":[…]}` (from `oz environment list`). |
 | `GET` | `/models` | Bearer | List available Oz models: `{"count":N,"current":"…","recommended":"…","models":[…]}` (from `oz model list`). `recommended` is the suggested model (default `kimi-k26-fireworks`, overridable via `OZ_RECOMMENDED_MODEL`). |
 | `POST` | `/runs/:runId/followups` | Bearer | Send a follow-up message to an existing Oz run via the Warp public API (in-process, not proxied). JSON body: `{"message":"…"}`. Returns `{"accepted":true}` on success. |
+| `GET` | `/agent/runs/:runId/status` | Bearer | Focused status view of a run (`oz run get`, filtered subset): run_id, title, state, created_at, updated_at, run_time, started_at, status_message, source, session_id, session_link, request_usage, agent_config_name, idle_timeout_minutes, conversation_id, parent_run_id, is_sandbox_running, artifacts, scope. `idle_timeout_minutes` / `parent_run_id` are `null` (not in CLI output). |
+| `GET` | `/agent/artifacts/:artifactUid` | Bearer | Artifact metadata (`oz artifact get`), passed through verbatim. |
+| `GET` | `/agent/runs/:runId/transcript` | Bearer | Normalized text-only transcript: `{run_id, conversation_id, entries:[{timestamp, role, text}]}`. Tool calls, results, events, and thinking are omitted; recursive steps are flattened pre-order. |
+| `GET` | `/agent/runs/:runId/result` | Bearer | The assistant's trailing final result: `{run_id, result}`. Trailing run of `role="assistant"` text entries joined by blank lines; falls back to `status_message.message`, else `result: ""`. |
 | `*` | `/*` | Bearer | *(proxied)* Anything else authenticated falls through to the internal server. |
 
 CORS on `/mcp`: `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, DELETE, OPTIONS`, `Allow-Headers` includes `Content-Type, Authorization, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID`, and `Expose-Headers: Mcp-Session-Id`.
@@ -152,7 +156,7 @@ JSON-RPC error responses follow the spec: `400` for a non-`initialize` POST with
 
 ## MCP tools exposed
 
-The internal `@sena-labs/oz-mcp-server` contributes the run/read tools; the proxy layer in `server.js` injects `oz_list_environments`, reimplements `oz_list_models` in-process, enforces required `model` (both run tools) and `environment` (cloud runs only) before forwarding, and implements `oz_run_followup` in-process via the Warp public API (the `oz` CLI has no follow-up command). `tools/list` reports 8 tools. The `oz` CLI must be authenticated (`WARP_API_KEY` or `oz login`) for any of them to return real data, and `oz_run_followup` additionally requires `WARP_API_KEY` to be set (it calls the REST API directly).
+The internal `@sena-labs/oz-mcp-server` contributes the run/read tools; the proxy layer in `server.js` injects `oz_list_environments`, reimplements `oz_list_models` in-process, enforces required `model` (both run tools) and `environment` (cloud runs only) before forwarding, implements `oz_run_followup` in-process via the Warp public API (the `oz` CLI has no follow-up command), and adds four focused read tools — `oz_run_status`, `oz_artifact_get`, `oz_run_transcript`, and `oz_run_result` — backed by `oz run get`, `oz run conversation get`, and `oz artifact get`. `tools/list` reports 12 tools. The `oz` CLI must be authenticated (`WARP_API_KEY` or `oz login`) for any of them to return real data, and `oz_run_followup` additionally requires `WARP_API_KEY` to be set (it calls the REST API directly).
 
 | Tool | Mode | Description |
 | --- | --- | --- |
@@ -160,6 +164,10 @@ The internal `@sena-labs/oz-mcp-server` contributes the run/read tools; the prox
 | `oz_agent_run_cloud` | cloud | Launch a cloud Oz agent. **Consumes Warp credits.** **`model` and `environment` are both required.** Returns a run id immediately; poll with `oz_run_get`. Params: `prompt` (required), `model` (**required**), `environment` (**required**), `skill`. |
 | `oz_run_get` | read-only | Fetch a run's status and output by id. Params: `runId` (required). |
 | `oz_run_list` | read-only | List recent runs, filterable by status (`all` / `active` / `completed` / raw statuses). Params: `status`, `limit`. |
+| `oz_run_status` | read-only | Focused status view of a run (`oz run get`, filtered to a field subset with `null` defaults for `idle_timeout_minutes` / `parent_run_id`). Params: `runId` (required). Also exposed as `GET /agent/runs/:runId/status`. Use instead of `oz_run_get` when only status is needed. |
+| `oz_artifact_get` | read-only | Fetch an artifact's metadata by uid (`oz artifact get`), passed through verbatim. Params: `artifactUid` (required). Also exposed as `GET /agent/artifacts/:artifactUid`. |
+| `oz_run_transcript` | read-only | Normalized text-only transcript of a run's conversation: reads `conversation_id` then `oz run conversation get`, flattens recursive steps pre-order keeping only `type="text"` content. Returns `{run_id, conversation_id, entries:[{timestamp, role, text}]}`. Params: `runId` (required). Also exposed as `GET /agent/runs/:runId/transcript`. |
+| `oz_run_result` | read-only | The assistant's trailing final result: trailing run of `role="assistant"` text entries joined by blank lines, falling back to `status_message.message`, else `""`. Params: `runId` (required). Also exposed as `GET /agent/runs/:runId/result`. |
 | `oz_run_followup` | write | Send a follow-up message to an existing run (queued, in progress, or ended). Implemented in-process via the Warp public API (`POST /agent/runs/{runId}/followups`); requires `WARP_API_KEY`. Params: `runId` (required), `message` (required). Returns `{ accepted: true }` on success; poll `oz_run_get` for updated state. |
 | `oz_list_environments` | read-only | List the cloud environments available to the account (`oz environment list`). No params. Also exposed as `GET /environments`. |
 | `oz_list_models` | read-only | List the AI model ids available to the account (`oz model list`), the current default, and the recommended model. No params. Also exposed as `GET /models`. |
@@ -262,7 +270,7 @@ curl -sS -i -X POST "$BASE/mcp" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
-# 4. with the returned Mcp-Session-Id, list tools (expect all 6)
+# 4. with the returned Mcp-Session-Id, list tools (expect all 12)
 curl -sS -X POST "$BASE/mcp" \
   -H "Authorization: Bearer $ACCESS" -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -285,7 +293,7 @@ npx @modelcontextprotocol/inspector
 3. Because this server's OAuth metadata does not advertise Dynamic Client Registration, use **Advanced settings** and provide:
    - **Client ID:** any non-empty string (e.g. `ozbridge`) — `/authorize` accepts any `client_id`.
    - **Client secret:** your `MCP_BEARER_TOKEN` value — `/token` validates it.
-4. Authorize. Claude.ai completes the OAuth flow and issues a bearer; on success it sends `POST /mcp` `initialize`, lists tools, and the 8 `oz_*` tools become available in chat.
+4. Authorize. Claude.ai completes the OAuth flow and issues a bearer; on success it sends `POST /mcp` `initialize`, lists tools, and the 12 `oz_*` tools become available in chat.
 
 If you'd rather avoid entering credentials manually, a fake DCR `/register` endpoint can be added (returning a fixed `client_id` / `client_secret` and a `registration_endpoint` in the AS metadata) so the default no-credentials flow works — not currently implemented.
 

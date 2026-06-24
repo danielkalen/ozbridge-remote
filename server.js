@@ -146,6 +146,119 @@ async function listOzModels() {
   return { count: models.length, current, recommended: OZ_RECOMMENDED_MODEL, models };
 }
 
+// ---- Run / conversation / artifact read helpers (in-process, via the oz CLI) ----
+// `oz_run_get` (upstream) returns the full run payload and truncates output. These
+// helpers provide focused views backed by `oz run get`, `oz run conversation get`,
+// and `oz artifact get`: a filtered status subset, artifact metadata, a normalized
+// text-only transcript, and the assistant's trailing final result.
+
+async function ozRunGet(runId) {
+  const stdout = await execOz(["run", "get", runId]);
+  return JSON.parse(stdout.trim());
+}
+
+// Focused status subset of `oz run get`. `idle_timeout_minutes` and `parent_run_id`
+// are not present in the CLI output (top-level or inside `agent_config`), so they
+// are returned as `null` when absent; `agent_config_name` is derived from
+// `agent_config?.name`. `status_message` is passed through (an object `{message}`
+// on completed runs).
+async function ozRunStatus(runId) {
+  const run = await ozRunGet(runId);
+  return {
+    run_id: run.run_id ?? null,
+    title: run.title ?? null,
+    state: run.state ?? null,
+    created_at: run.created_at ?? null,
+    updated_at: run.updated_at ?? null,
+    run_time: run.run_time ?? null,
+    started_at: run.started_at ?? null,
+    status_message: run.status_message ?? null,
+    source: run.source ?? null,
+    session_id: run.session_id ?? null,
+    session_link: run.session_link ?? null,
+    request_usage: run.request_usage ?? null,
+    agent_config_name: run.agent_config?.name ?? null,
+    idle_timeout_minutes: run.idle_timeout_minutes ?? null,
+    conversation_id: run.conversation_id ?? null,
+    parent_run_id: run.parent_run_id ?? null,
+    is_sandbox_running: run.is_sandbox_running ?? null,
+    artifacts: run.artifacts ?? null,
+    scope: run.scope ?? null,
+  };
+}
+
+async function ozConversationGet(conversationId) {
+  const stdout = await execOz(["run", "conversation", "get", conversationId]);
+  return JSON.parse(stdout.trim());
+}
+
+async function ozArtifactGet(artifactUid) {
+  const stdout = await execOz(["artifact", "get", artifactUid]);
+  return JSON.parse(stdout.trim());
+}
+
+// Walk a conversation's recursive `steps` tree pre-order — a step's own messages
+// first, then its sub-steps — and emit one entry per `type==="text"` content item.
+// Tool calls (`action`), results (`action_result`), events, and thinking are
+// omitted; `role` and `timestamp` are preserved. Multiple text entries in one
+// message become multiple entries.
+function walkTranscriptStep(step, out) {
+  if (!step || typeof step !== "object") return;
+  const messages = Array.isArray(step.messages) ? step.messages : [];
+  for (const msg of messages) {
+    const role = msg?.role ?? null;
+    const timestamp = msg?.timestamp ?? null;
+    const content = Array.isArray(msg?.content) ? msg.content : [];
+    for (const c of content) {
+      if (c?.type === "text" && typeof c.text === "string") {
+        out.push({ timestamp, role, text: c.text });
+      }
+    }
+  }
+  const subSteps = Array.isArray(step.steps) ? step.steps : [];
+  for (const sub of subSteps) walkTranscriptStep(sub, out);
+}
+
+function flattenTranscript(conv) {
+  const out = [];
+  const steps = Array.isArray(conv?.steps) ? conv.steps : [];
+  for (const step of steps) walkTranscriptStep(step, out);
+  return out;
+}
+
+async function ozRunTranscript(runId) {
+  const run = await ozRunGet(runId);
+  const conversationId = run?.conversation_id;
+  let entries = [];
+  if (nonEmptyString(conversationId)) {
+    const conv = await ozConversationGet(conversationId);
+    entries = flattenTranscript(conv);
+  }
+  return { run_id: run?.run_id ?? runId, conversation_id: conversationId ?? null, entries };
+}
+
+// The assistant's final result: the trailing run of `role==="assistant"` text
+// entries from the transcript, joined by blank lines. Falls back to
+// `run.status_message?.message`, else returns an empty string.
+async function ozRunResult(runId) {
+  const { entries } = await ozRunTranscript(runId);
+  const trailing = [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].role === "assistant") trailing.unshift(entries[i].text);
+    else break;
+  }
+  if (trailing.length) return trailing.join("\n\n");
+  const run = await ozRunGet(runId);
+  const sm = run?.status_message;
+  return (sm && typeof sm === "object" && typeof sm.message === "string") ? sm.message : "";
+}
+
+// Map an `execOz` / `oz*Get` failure to an HTTP status: a CLI "not found" -> 404,
+// anything else -> 502 (mirrors the `/environments` 502 style).
+function ozCliErrorStatus(err) {
+  return /not found/i.test(err?.message || "") ? 404 : 502;
+}
+
 // Send a follow-up message to an existing Oz run via the Warp public API. The oz
 // CLI has no follow-up subcommand, so this calls POST /agent/runs/{runId}/followups
 // directly using WARP_API_KEY (already in process.env). Works for queued, running,
@@ -262,6 +375,54 @@ const PROXY_TOOL_DESCRIPTORS = {
       },
     },
   },
+  oz_run_status: {
+    name: "oz_run_status",
+    description:
+      "Fetch a focused status view of an Oz run by id (`oz run get`), returning the field subset (run_id, title, state, created_at, updated_at, run_time, started_at, status_message, source, session_id, session_link, request_usage, agent_config_name, idle_timeout_minutes, conversation_id, parent_run_id, is_sandbox_running, artifacts, scope) with null defaults for fields the CLI does not expose (idle_timeout_minutes, parent_run_id). Read-only. Use this instead of oz_run_get when you only need status. Also exposed as GET /agent/runs/:runId/status.",
+    inputSchema: {
+      type: "object",
+      required: ["runId"],
+      properties: {
+        runId: { type: "string", description: "The run id to inspect (the id returned by oz_agent_run_cloud or seen in oz_run_list)." },
+      },
+    },
+  },
+  oz_artifact_get: {
+    name: "oz_artifact_get",
+    description:
+      "Fetch an Oz artifact's metadata by uid (`oz artifact get`). Read-only; the artifact payload is passed through verbatim. Also exposed as GET /agent/artifacts/:artifactUid.",
+    inputSchema: {
+      type: "object",
+      required: ["artifactUid"],
+      properties: {
+        artifactUid: { type: "string", description: "The artifact uid (as seen in a run's `artifacts` array from oz_run_status / oz_run_get)." },
+      },
+    },
+  },
+  oz_run_transcript: {
+    name: "oz_run_transcript",
+    description:
+      "Fetch a normalized, text-only transcript of an Oz run by id. Reads the run's conversation_id (`oz run get`), then the conversation (`oz run conversation get`), and flattens its recursive steps pre-order, keeping only `type===\"text\"` content (tool calls, results, events, and thinking are omitted). Returns { run_id, conversation_id, entries: [{ timestamp, role, text }] }. Read-only. Also exposed as GET /agent/runs/:runId/transcript.",
+    inputSchema: {
+      type: "object",
+      required: ["runId"],
+      properties: {
+        runId: { type: "string", description: "The run id whose conversation transcript to fetch." },
+      },
+    },
+  },
+  oz_run_result: {
+    name: "oz_run_result",
+    description:
+      "Fetch the assistant's final result for an Oz run by id: takes the trailing run of `role===\"assistant\"` text entries from the transcript and joins them with blank lines; falls back to run.status_message.message, else returns an empty string. Read-only. Also exposed as GET /agent/runs/:runId/result.",
+    inputSchema: {
+      type: "object",
+      required: ["runId"],
+      properties: {
+        runId: { type: "string", description: "The run id whose final assistant result to fetch." },
+      },
+    },
+  },
 };
 
 function createProxyServer(client) {
@@ -306,6 +467,30 @@ function createProxyServer(client) {
       } catch (err) {
         return toolTextResult(`Error sending follow-up: ${err.message}`, true);
       }
+    }
+
+    if (name === "oz_run_status") {
+      if (!nonEmptyString(args.runId)) return toolTextResult("Missing required argument: runId.", true);
+      try { return toolTextResult(JSON.stringify(await ozRunStatus(args.runId), null, 2)); }
+      catch (err) { return toolTextResult(`Error fetching run status: ${err.message}`, true); }
+    }
+
+    if (name === "oz_artifact_get") {
+      if (!nonEmptyString(args.artifactUid)) return toolTextResult("Missing required argument: artifactUid.", true);
+      try { return toolTextResult(JSON.stringify(await ozArtifactGet(args.artifactUid), null, 2)); }
+      catch (err) { return toolTextResult(`Error fetching artifact: ${err.message}`, true); }
+    }
+
+    if (name === "oz_run_transcript") {
+      if (!nonEmptyString(args.runId)) return toolTextResult("Missing required argument: runId.", true);
+      try { return toolTextResult(JSON.stringify(await ozRunTranscript(args.runId), null, 2)); }
+      catch (err) { return toolTextResult(`Error fetching run transcript: ${err.message}`, true); }
+    }
+
+    if (name === "oz_run_result") {
+      if (!nonEmptyString(args.runId)) return toolTextResult("Missing required argument: runId.", true);
+      try { return toolTextResult(await ozRunResult(args.runId)); }
+      catch (err) { return toolTextResult(`Error fetching run result: ${err.message}`, true); }
     }
 
     if (name === "oz_agent_run") {
@@ -547,6 +732,50 @@ app.get("/models", checkAuth, async (req, res) => {
     res.json(await listOzModels());
   } catch (err) {
     res.status(502).json({ error: "oz_model_list_failed", message: err.message });
+  }
+});
+
+// GET /agent/runs/:runId/status — focused status view (oz run get, filtered subset).
+app.get("/agent/runs/:runId/status", checkAuth, async (req, res) => {
+  const { runId } = req.params;
+  if (!nonEmptyString(runId)) return res.status(400).json({ error: "invalid_request", message: "runId is required." });
+  try {
+    res.json(await ozRunStatus(runId));
+  } catch (err) {
+    res.status(ozCliErrorStatus(err)).json({ error: "oz_run_status_failed", message: err.message });
+  }
+});
+
+// GET /agent/artifacts/:artifactUid — artifact metadata (oz artifact get, passed through).
+app.get("/agent/artifacts/:artifactUid", checkAuth, async (req, res) => {
+  const { artifactUid } = req.params;
+  if (!nonEmptyString(artifactUid)) return res.status(400).json({ error: "invalid_request", message: "artifactUid is required." });
+  try {
+    res.json(await ozArtifactGet(artifactUid));
+  } catch (err) {
+    res.status(ozCliErrorStatus(err)).json({ error: "oz_artifact_get_failed", message: err.message });
+  }
+});
+
+// GET /agent/runs/:runId/transcript — normalized text-only conversation transcript.
+app.get("/agent/runs/:runId/transcript", checkAuth, async (req, res) => {
+  const { runId } = req.params;
+  if (!nonEmptyString(runId)) return res.status(400).json({ error: "invalid_request", message: "runId is required." });
+  try {
+    res.json(await ozRunTranscript(runId));
+  } catch (err) {
+    res.status(ozCliErrorStatus(err)).json({ error: "oz_run_transcript_failed", message: err.message });
+  }
+});
+
+// GET /agent/runs/:runId/result — the assistant's trailing final result text.
+app.get("/agent/runs/:runId/result", checkAuth, async (req, res) => {
+  const { runId } = req.params;
+  if (!nonEmptyString(runId)) return res.status(400).json({ error: "invalid_request", message: "runId is required." });
+  try {
+    res.json({ run_id: runId, result: await ozRunResult(runId) });
+  } catch (err) {
+    res.status(ozCliErrorStatus(err)).json({ error: "oz_run_result_failed", message: err.message });
   }
 });
 
