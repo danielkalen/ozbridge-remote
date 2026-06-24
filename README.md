@@ -43,7 +43,7 @@ This server bridges that gap. One process:
    - exposes `/mcp` as a Streamable HTTP endpoint that translates each downstream session into an upstream SSE connection to the internal server,
    - proxies every other authenticated path (`/sse`, `/messages`, `/health`, …) straight through to the internal server for legacy SSE clients.
 
-The result: a single public URL (e.g. `https://ozbridge-mcp-aejjk.sevalla.app/mcp`) that Claude.ai can add as a custom connector, authenticate against, and then drive your Warp Oz agents — run agents, list runs, poll status, switch models — from inside Claude.
+The result: a single public URL (e.g. `https://ozbridge-mcp-aejjk.sevalla.app/mcp`) that Claude.ai can add as a custom connector, authenticate against, and then drive your Warp Oz agents — run agents, send follow-ups to runs, list runs, poll status, switch models — from inside Claude.
 
 ---
 
@@ -141,6 +141,7 @@ The metadata does **not** currently advertise a `registration_endpoint` (Dynamic
 | `GET` | `/health` | Bearer | *(proxied)* Internal health: `{"ok":true,"name":"oz-mcp-server","version":"…","tools":6,"sessions":N}`. |
 | `GET` | `/environments` | Bearer | List cloud Oz environments: `{"count":N,"environments":[…]}` (from `oz environment list`). |
 | `GET` | `/models` | Bearer | List available Oz models: `{"count":N,"current":"…","recommended":"…","models":[…]}` (from `oz model list`). `recommended` is the suggested model (default `kimi-k26-fireworks`, overridable via `OZ_RECOMMENDED_MODEL`). |
+| `POST` | `/runs/:runId/followups` | Bearer | Send a follow-up message to an existing Oz run via the Warp public API (in-process, not proxied). JSON body: `{"message":"…"}`. Returns `{"accepted":true}` on success. |
 | `*` | `/*` | Bearer | *(proxied)* Anything else authenticated falls through to the internal server. |
 
 CORS on `/mcp`: `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, DELETE, OPTIONS`, `Allow-Headers` includes `Content-Type, Authorization, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID`, and `Expose-Headers: Mcp-Session-Id`.
@@ -151,7 +152,7 @@ JSON-RPC error responses follow the spec: `400` for a non-`initialize` POST with
 
 ## MCP tools exposed
 
-The internal `@sena-labs/oz-mcp-server` contributes the run/read tools; the proxy layer in `server.js` injects `oz_list_environments`, reimplements `oz_list_models` in-process, and enforces required `model` (both run tools) and `environment` (cloud runs only) before forwarding. `tools/list` reports 7 tools. The `oz` CLI must be authenticated (`WARP_API_KEY` or `oz login`) for any of them to return real data.
+The internal `@sena-labs/oz-mcp-server` contributes the run/read tools; the proxy layer in `server.js` injects `oz_list_environments`, reimplements `oz_list_models` in-process, enforces required `model` (both run tools) and `environment` (cloud runs only) before forwarding, and implements `oz_run_followup` in-process via the Warp public API (the `oz` CLI has no follow-up command). `tools/list` reports 8 tools. The `oz` CLI must be authenticated (`WARP_API_KEY` or `oz login`) for any of them to return real data, and `oz_run_followup` additionally requires `WARP_API_KEY` to be set (it calls the REST API directly).
 
 | Tool | Mode | Description |
 | --- | --- | --- |
@@ -159,6 +160,7 @@ The internal `@sena-labs/oz-mcp-server` contributes the run/read tools; the prox
 | `oz_agent_run_cloud` | cloud | Launch a cloud Oz agent. **Consumes Warp credits.** **`model` and `environment` are both required.** Returns a run id immediately; poll with `oz_run_get`. Params: `prompt` (required), `model` (**required**), `environment` (**required**), `skill`. |
 | `oz_run_get` | read-only | Fetch a run's status and output by id. Params: `runId` (required). |
 | `oz_run_list` | read-only | List recent runs, filterable by status (`all` / `active` / `completed` / raw statuses). Params: `status`, `limit`. |
+| `oz_run_followup` | write | Send a follow-up message to an existing run (queued, in progress, or ended). Implemented in-process via the Warp public API (`POST /agent/runs/{runId}/followups`); requires `WARP_API_KEY`. Params: `runId` (required), `message` (required). Returns `{ accepted: true }` on success; poll `oz_run_get` for updated state. |
 | `oz_list_environments` | read-only | List the cloud environments available to the account (`oz environment list`). No params. Also exposed as `GET /environments`. |
 | `oz_list_models` | read-only | List the AI model ids available to the account (`oz model list`), the current default, and the recommended model. No params. Also exposed as `GET /models`. |
 | `oz_set_default_model` | write | Set the default Oz model by writing `defaultModel` into the workspace `.warp/warp-bridge.yaml`. Params: `model` (required, e.g. `claude-4-8-opus-max` or `auto`). |
@@ -185,8 +187,9 @@ Runtime configuration is entirely env-based. Copy `.env.example` to `.env` for l
 | `OZ_DEFAULT_PROFILE` | no | `Default` | Default Oz agent profile (passed through). |
 | `OZ_TIMEOUT_MS` | no | `300000` | Hard timeout for local runs in ms (passed through). |
 | `OZ_IDLE_TIMEOUT_MS` | no | `90000` | Abort a local run after this long with no CLI output (passed through). |
-| `OZ_LIST_TIMEOUT_MS` | no | `30000` | Hard timeout (ms) for the proxy's own `oz environment list` / `oz model list` calls backing the listing tools and `GET /environments` / `GET /models`. |
+| `OZ_LIST_TIMEOUT_MS` | no | `30000` | Hard timeout (ms) for the proxy's own `oz environment list` / `oz model list` calls backing the listing tools, `GET /environments` / `GET /models`, and the direct Oz API followup POST (`oz_run_followup` / `POST /runs/:runId/followups`). |
 | `OZ_RECOMMENDED_MODEL` | no | `kimi-k26-fireworks` | Model id advertised as `recommended` in the `oz_list_models` tool and `GET /models` output. Override to point clients at a different suggested model. |
+| `OZ_API_BASE_URL` | no | `https://app.warp.dev/api/v1` | Base URL of the Warp public API used by the in-process `oz_run_followup` tool and `POST /runs/:runId/followups` endpoint. Override to point at staging. |
 
 > The internal port `3848` is fixed in code and bound to `127.0.0.1` only; it is not configurable and never exposed publicly.
 
@@ -282,7 +285,7 @@ npx @modelcontextprotocol/inspector
 3. Because this server's OAuth metadata does not advertise Dynamic Client Registration, use **Advanced settings** and provide:
    - **Client ID:** any non-empty string (e.g. `ozbridge`) — `/authorize` accepts any `client_id`.
    - **Client secret:** your `MCP_BEARER_TOKEN` value — `/token` validates it.
-4. Authorize. Claude.ai completes the OAuth flow and issues a bearer; on success it sends `POST /mcp` `initialize`, lists tools, and the 7 `oz_*` tools become available in chat.
+4. Authorize. Claude.ai completes the OAuth flow and issues a bearer; on success it sends `POST /mcp` `initialize`, lists tools, and the 8 `oz_*` tools become available in chat.
 
 If you'd rather avoid entering credentials manually, a fake DCR `/register` endpoint can be added (returning a fixed `client_id` / `client_secret` and a `registration_endpoint` in the AS metadata) so the default no-credentials flow works — not currently implemented.
 

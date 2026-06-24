@@ -69,6 +69,9 @@ async function createUpstreamClient() {
 const OZ_PATH = process.env.OZ_PATH || "oz";
 const OZ_LIST_TIMEOUT_MS = parseInt(process.env.OZ_LIST_TIMEOUT_MS ?? "30000", 10);
 const OZ_RECOMMENDED_MODEL = process.env.OZ_RECOMMENDED_MODEL || "kimi-k26-fireworks";
+// Base URL of the Warp public API. Used by the in-process follow-up tool/endpoint
+// (the oz CLI has no follow-up command, so we call the REST API directly).
+const OZ_API_BASE_URL = (process.env.OZ_API_BASE_URL || "https://app.warp.dev/api/v1").replace(/\/+$/, "");
 
 // Run a read-only `oz` CLI subcommand with JSON output and a bounded timeout.
 // Inherits process.env (so WARP_API_KEY / `oz login` state reach the CLI) and
@@ -143,6 +146,47 @@ async function listOzModels() {
   return { count: models.length, current, recommended: OZ_RECOMMENDED_MODEL, models };
 }
 
+// Send a follow-up message to an existing Oz run via the Warp public API. The oz
+// CLI has no follow-up subcommand, so this calls POST /agent/runs/{runId}/followups
+// directly using WARP_API_KEY (already in process.env). Works for queued, running,
+// or ended runs; a 2xx means accepted. Poll oz_run_get / GET /agent/runs/{runId}
+// for updated state.
+async function submitOzRunFollowup(runId, message) {
+  const apiKey = process.env.WARP_API_KEY;
+  if (!nonEmptyString(apiKey)) {
+    throw new Error("WARP_API_KEY is not configured; cannot call the Oz API directly.");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OZ_LIST_TIMEOUT_MS);
+  try {
+    const resp = await fetch(`${OZ_API_BASE_URL}/agent/runs/${encodeURIComponent(runId)}/followups`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ message }),
+      signal: controller.signal,
+    });
+    const text = await resp.text();
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch {}
+    if (!resp.ok) {
+      const detail = parsed ? JSON.stringify(parsed) : (text || "").substring(0, 500);
+      throw new Error(`Oz API followup failed: HTTP ${resp.status} ${resp.statusText}${detail ? ` — ${detail}` : ""}`);
+    }
+    return parsed ?? { accepted: true };
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Oz API followup timed out after ${OZ_LIST_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function nonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
@@ -205,6 +249,19 @@ const PROXY_TOOL_DESCRIPTORS = {
       },
     },
   },
+  oz_run_followup: {
+    name: "oz_run_followup",
+    description:
+      "Send a follow-up message to an existing Oz run. Works whether the run is queued, in progress, or ended (terminated); the server routes the message based on current run state. A success means the follow-up was accepted — poll oz_run_get for updated state. Implemented in-process via the Warp public API and requires WARP_API_KEY.",
+    inputSchema: {
+      type: "object",
+      required: ["runId", "message"],
+      properties: {
+        runId: { type: "string", description: "The run id to append the follow-up to (the id returned by oz_agent_run_cloud or seen in oz_run_list)." },
+        message: { type: "string", description: "The follow-up prompt to send to the run." },
+      },
+    },
+  },
 };
 
 function createProxyServer(client) {
@@ -234,6 +291,21 @@ function createProxyServer(client) {
     if (name === "oz_list_models") {
       try { return toolTextResult(JSON.stringify(await listOzModels(), null, 2)); }
       catch (err) { return toolTextResult(`Error listing models: ${err.message}`, true); }
+    }
+
+    if (name === "oz_run_followup") {
+      const missing = [];
+      if (!nonEmptyString(args.runId)) missing.push("runId");
+      if (!nonEmptyString(args.message)) missing.push("message");
+      if (missing.length) {
+        return toolTextResult(`Missing required argument(s): ${missing.join(", ")}.`, true);
+      }
+      try {
+        const result = await submitOzRunFollowup(args.runId, args.message);
+        return toolTextResult(JSON.stringify(result, null, 2));
+      } catch (err) {
+        return toolTextResult(`Error sending follow-up: ${err.message}`, true);
+      }
     }
 
     if (name === "oz_agent_run") {
@@ -475,6 +547,22 @@ app.get("/models", checkAuth, async (req, res) => {
     res.json(await listOzModels());
   } catch (err) {
     res.status(502).json({ error: "oz_model_list_failed", message: err.message });
+  }
+});
+
+// POST /runs/:runId/followups — send a follow-up message to an existing Oz run via
+// the Warp public API (in-process, not proxied to the internal oz-mcp-server).
+app.post("/runs/:runId/followups", checkAuth, async (req, res) => {
+  const { runId } = req.params;
+  const message = req.body?.message;
+  if (!nonEmptyString(runId) || !nonEmptyString(message)) {
+    return res.status(400).json({ error: "invalid_request", message: "Both `runId` (path) and `message` (JSON body) are required." });
+  }
+  try {
+    res.json(await submitOzRunFollowup(runId, message));
+  } catch (err) {
+    const status = /timed out/.test(err.message) ? 504 : 502;
+    res.status(status).json({ error: "oz_run_followup_failed", message: err.message });
   }
 });
 
