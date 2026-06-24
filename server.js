@@ -66,13 +66,191 @@ async function createUpstreamClient() {
   return client;
 }
 
+const OZ_PATH = process.env.OZ_PATH || "oz";
+const OZ_LIST_TIMEOUT_MS = parseInt(process.env.OZ_LIST_TIMEOUT_MS ?? "30000", 10);
+
+// Run a read-only `oz` CLI subcommand with JSON output and a bounded timeout.
+// Inherits process.env (so WARP_API_KEY / `oz login` state reach the CLI) and
+// forces WARP_OUTPUT_FORMAT=json so the result is parseable.
+function execOz(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(OZ_PATH, args, {
+      env: { ...process.env, WARP_OUTPUT_FORMAT: "json" },
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill("SIGKILL"); } catch {}
+      reject(new Error(`oz ${args.join(" ")} timed out after ${OZ_LIST_TIMEOUT_MS}ms`));
+    }, OZ_LIST_TIMEOUT_MS);
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        const msg = (stderr || stdout || `exit code ${code}`).trim();
+        reject(new Error(`oz ${args.join(" ")} failed: ${msg.substring(0, 500)}`));
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+function extractOzItems(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === "object") {
+    for (const key of ["items", "environments", "models", "data", "results"]) {
+      if (Array.isArray(parsed[key])) return parsed[key];
+    }
+    return [parsed];
+  }
+  return [];
+}
+
+async function listOzEnvironments() {
+  const stdout = await execOz(["environment", "list"]);
+  let parsed = null;
+  try { parsed = JSON.parse(stdout.trim()); } catch {}
+  const environments = extractOzItems(parsed);
+  return { count: environments.length, environments };
+}
+
+async function listOzModels() {
+  const stdout = await execOz(["model", "list"]);
+  let parsed = null;
+  try { parsed = JSON.parse(stdout.trim()); } catch {}
+  const models = [];
+  const seen = new Set();
+  for (const m of extractOzItems(parsed)) {
+    const id = m && typeof m.id === "string" ? m.id : null;
+    if (id && !seen.has(id)) { seen.add(id); models.push(id); }
+  }
+  const current = process.env.OZ_DEFAULT_MODEL || "auto";
+  return { count: models.length, current, models };
+}
+
+function nonEmptyString(v) {
+  return typeof v === "string" && v.trim().length > 0;
+}
+
+function toolTextResult(text, isError = false) {
+  return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
+}
+
+function missingArgResult(missing) {
+  return toolTextResult(
+    `Missing required argument(s): ${missing.join(", ")}. ` +
+      `Call oz_list_environments for environment ids and oz_list_models for model ids, then pass them explicitly.`,
+    true,
+  );
+}
+
+// Tools the proxy owns: injected (oz_list_environments), reimplemented in-process
+// (oz_list_models), or re-described with required args + pre-flight validation
+// (oz_agent_run, oz_agent_run_cloud). These override the upstream descriptors.
+const PROXY_TOOL_DESCRIPTORS = {
+  oz_list_environments: {
+    name: "oz_list_environments",
+    description:
+      "List the Warp Oz cloud environments available to the account (from `oz environment list`). Read-only. Pass one of the returned `id` values as `environment` to `oz_agent_run_cloud`.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  oz_list_models: {
+    name: "oz_list_models",
+    description:
+      "List the AI model ids available to the Warp Oz account (from `oz model list`) and report the current default. Read-only. Pass one of these ids as `model` to `oz_agent_run` / `oz_agent_run_cloud`.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  oz_agent_run: {
+    name: "oz_agent_run",
+    description:
+      "Run a Warp Oz agent locally and return its output (`oz agent run`). `model` is required - a model id from `oz_list_models` (e.g. `claude-4-8-opus-max` or `auto`).",
+    inputSchema: {
+      type: "object",
+      required: ["prompt", "model"],
+      properties: {
+        prompt: { type: "string", description: "Natural-language instruction for the agent." },
+        model: { type: "string", description: "Required model id from oz_list_models (e.g. `claude-4-8-opus-max`, `auto`)." },
+        profile: { type: "string", description: "Optional Oz agent profile name." },
+        skill: { type: "string", description: "Optional agent skill id (e.g. `5-test-agent`)." },
+      },
+    },
+  },
+  oz_agent_run_cloud: {
+    name: "oz_agent_run_cloud",
+    description:
+      "Launch a cloud Warp Oz agent. CONSUMES WARP CREDITS. Both `environment` (from `oz_list_environments`) and `model` (from `oz_list_models`) are required. Returns the run id immediately; use `oz_run_get` to poll terminal status.",
+    inputSchema: {
+      type: "object",
+      required: ["prompt", "model", "environment"],
+      properties: {
+        prompt: { type: "string", description: "Natural-language instruction for the cloud agent." },
+        model: { type: "string", description: "Required model id from oz_list_models (e.g. `claude-4-8-opus-max`, `auto`)." },
+        environment: { type: "string", description: "Required cloud environment id from oz_list_environments (e.g. `MeFGBLVKN3I6Bo6TrvYiCP`)." },
+        skill: { type: "string", description: "Optional agent skill id." },
+      },
+    },
+  },
+};
+
 function createProxyServer(client) {
   const server = new Server(
     { name: "ozbridge-mcp", version: "1.0.0" },
     { capabilities: { tools: {} } },
   );
-  server.setRequestHandler(ListToolsRequestSchema, async (req) => client.listTools(req.params));
-  server.setRequestHandler(CallToolRequestSchema, async (req) => client.callTool(req.params));
+
+  // tools/list: drop the upstream descriptors we override, then append ours.
+  server.setRequestHandler(ListToolsRequestSchema, async (req) => {
+    const upstream = await client.listTools(req.params);
+    const tools = (upstream.tools || []).filter((t) => !PROXY_TOOL_DESCRIPTORS[t.name]);
+    tools.push(...Object.values(PROXY_TOOL_DESCRIPTORS));
+    return { tools };
+  });
+
+  // tools/call: handle proxy-owned tools in-process; pre-flight validate the run
+  // tools; forward everything else to the upstream oz-mcp-server verbatim.
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const { name, arguments: args = {} } = req.params || {};
+
+    if (name === "oz_list_environments") {
+      try { return toolTextResult(JSON.stringify(await listOzEnvironments(), null, 2)); }
+      catch (err) { return toolTextResult(`Error listing environments: ${err.message}`, true); }
+    }
+
+    if (name === "oz_list_models") {
+      try { return toolTextResult(JSON.stringify(await listOzModels(), null, 2)); }
+      catch (err) { return toolTextResult(`Error listing models: ${err.message}`, true); }
+    }
+
+    if (name === "oz_agent_run") {
+      const missing = [];
+      if (!nonEmptyString(args.model)) missing.push("model");
+      if (missing.length) return missingArgResult(missing);
+    }
+
+    if (name === "oz_agent_run_cloud") {
+      const missing = [];
+      if (!nonEmptyString(args.model)) missing.push("model");
+      if (!nonEmptyString(args.environment)) missing.push("environment");
+      if (missing.length) return missingArgResult(missing);
+    }
+
+    return client.callTool(req.params);
+  });
+
   server.setRequestHandler(PingRequestSchema, async () => client.ping());
   return server;
 }
@@ -278,6 +456,26 @@ app.delete("/mcp", checkAuth, async (req, res) => {
   res.status(200).end();
 });
 // ---- end /mcp bridge ----
+
+// ---- REST listing endpoints (Bearer-authed, handled in-process) ----
+// Mirror the oz_list_environments / oz_list_models MCP tools as plain JSON
+// GETs. Registered before the catch-all proxy so they are served here instead
+// of being forwarded to the internal server (which would 404 on them).
+app.get("/environments", checkAuth, async (req, res) => {
+  try {
+    res.json(await listOzEnvironments());
+  } catch (err) {
+    res.status(502).json({ error: "oz_environment_list_failed", message: err.message });
+  }
+});
+
+app.get("/models", checkAuth, async (req, res) => {
+  try {
+    res.json(await listOzModels());
+  } catch (err) {
+    res.status(502).json({ error: "oz_model_list_failed", message: err.message });
+  }
+});
 
 app.use(checkAuth, proxy);
 
