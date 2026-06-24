@@ -4,12 +4,78 @@ import { randomUUID, createHash } from "crypto";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  PingRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const PORT = parseInt(process.env.PORT ?? "3847", 10);
 const INTERNAL_PORT = 3848;
 const BASE_URL = process.env.BASE_URL;
+
+// Streamable HTTP -> SSE bridge settings
+const MCP_IDLE_TIMEOUT_MS = parseInt(process.env.MCP_IDLE_TIMEOUT_MS ?? String(30 * 60 * 1000), 10);
+const MCP_MAX_SESSIONS = parseInt(process.env.MCP_MAX_SESSIONS ?? "100", 10);
+// sessionId -> { server, transport, client, timer }
+const mcpSessions = new Map();
+
+function jsonRpcError(res, status, code, message, id = null) {
+  if (!res.headersSent) {
+    res.status(status).json({ jsonrpc: "2.0", error: { code, message }, id });
+  }
+}
+
+function setMcpCors(res) {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID");
+  res.set("Access-Control-Expose-Headers", "Mcp-Session-Id");
+  res.set("Access-Control-Max-Age", "86400");
+}
+
+async function closeMcpSession(sessionId) {
+  const s = mcpSessions.get(sessionId);
+  if (!s) return;
+  if (s.timer) clearTimeout(s.timer);
+  mcpSessions.delete(sessionId);
+  try { await s.transport.close(); } catch {}
+  try { await s.client.close(); } catch {}
+}
+
+function armMcpTimer(sessionId) {
+  const s = mcpSessions.get(sessionId);
+  if (!s) return;
+  if (s.timer) clearTimeout(s.timer);
+  s.timer = setTimeout(() => { closeMcpSession(sessionId).catch(() => {}); }, MCP_IDLE_TIMEOUT_MS);
+}
+
+async function createUpstreamClient() {
+  const client = new Client(
+    { name: "ozbridge-proxy", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  const transport = new SSEClientTransport(new URL(`http://127.0.0.1:${INTERNAL_PORT}/sse`));
+  await client.connect(transport);
+  return client;
+}
+
+function createProxyServer(client) {
+  const server = new Server(
+    { name: "ozbridge-mcp", version: "1.0.0" },
+    { capabilities: { tools: {} } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async (req) => client.listTools(req.params));
+  server.setRequestHandler(CallToolRequestSchema, async (req) => client.callTool(req.params));
+  server.setRequestHandler(PingRequestSchema, async () => client.ping());
+  return server;
+}
 
 const codes = new Map();
 const tokens = new Map();
@@ -130,6 +196,88 @@ const proxy = createProxyMiddleware({
   logLevel: "silent",
   onProxyReq: (proxyReq) => proxyReq.removeHeader("authorization"),
 });
+
+// ---- Streamable HTTP /mcp endpoint (for Claude.ai connectors) ----
+// Bridges Streamable HTTP on the public side to the legacy SSE transport
+// exposed by the internal oz-mcp-server. Registered before the catch-all
+// SSE proxy so /mcp is served here and everything else still falls through.
+app.options("/mcp", (req, res) => { setMcpCors(res); res.status(204).end(); });
+
+app.post("/mcp", checkAuth, async (req, res) => {
+  setMcpCors(res);
+  const sessionId = req.headers["mcp-session-id"];
+
+  if (sessionId) {
+    const session = mcpSessions.get(sessionId);
+    if (!session) {
+      // Spec: requests with an invalid/unknown session ID return 404 Not Found.
+      return jsonRpcError(res, 404, -32001, "Session not found", req.body?.id ?? null);
+    }
+    armMcpTimer(sessionId);
+    try {
+      await session.transport.handleRequest(req, res, req.body);
+    } catch (err) {
+      console.error("[mcp] session handle error:", err);
+      jsonRpcError(res, 500, -32603, "Internal error", req.body?.id ?? null);
+    }
+    return;
+  }
+
+  // No session id: must be an initialize request to start a new session.
+  const isInitialize = req.body && req.body.method === "initialize";
+  if (!isInitialize) {
+    // Spec: non-initialization requests without a session ID return 400 Bad Request.
+    return jsonRpcError(res, 400, -32600, "Bad Request: initialize required to start a session", req.body?.id ?? null);
+  }
+  if (mcpSessions.size >= MCP_MAX_SESSIONS) {
+    return jsonRpcError(res, 503, -32603, "Too many concurrent sessions", req.body?.id ?? null);
+  }
+
+  let client;
+  try {
+    client = await createUpstreamClient();
+  } catch (err) {
+    console.error("[mcp] upstream connect failed:", err);
+    return jsonRpcError(res, 502, -32603, "Upstream MCP server unavailable", req.body?.id ?? null);
+  }
+
+  const server = createProxyServer(client);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (sid) => {
+      mcpSessions.set(sid, { server, transport, client, timer: null });
+      armMcpTimer(sid);
+    },
+  });
+
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("[mcp] initialize failed:", err);
+    const sid = transport.sessionId;
+    if (sid) await closeMcpSession(sid);
+    else { try { await client.close(); } catch {} }
+    jsonRpcError(res, 500, -32603, "Internal error", req.body?.id ?? null);
+  }
+});
+
+app.get("/mcp", checkAuth, (req, res) => {
+  setMcpCors(res);
+  res.set("Allow", "POST, DELETE");
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method Not Allowed: server-initiated streams are not supported" }, id: null });
+});
+
+app.delete("/mcp", checkAuth, async (req, res) => {
+  setMcpCors(res);
+  const sessionId = req.headers["mcp-session-id"];
+  if (!sessionId || !mcpSessions.has(sessionId)) {
+    return res.status(404).json({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
+  }
+  await closeMcpSession(sessionId);
+  res.status(200).end();
+});
+// ---- end /mcp bridge ----
 
 app.use(checkAuth, proxy);
 
