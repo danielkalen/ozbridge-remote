@@ -140,7 +140,7 @@ The metadata does **not** currently advertise a `registration_endpoint` (Dynamic
 | `POST` | `/messages?sessionId=…` | Bearer | *(proxied)* Legacy SSE JSON-RPC POST; ack `202`, response streams over `/sse`. |
 | `GET` | `/health` | Bearer | *(proxied)* Internal health: `{"ok":true,"name":"oz-mcp-server","version":"…","tools":6,"sessions":N}`. |
 | `GET` | `/environments` | Bearer | List cloud Oz environments: `{"count":N,"environments":[…]}` (from `oz environment list`). |
-| `GET` | `/models` | Bearer | List available Oz models: `{"count":N,"current":"…","models":[…]}` (from `oz model list`). |
+| `GET` | `/models` | Bearer | List available Oz models: `{"count":N,"current":"…","recommended":"…","models":[…]}` (from `oz model list`). `recommended` is the suggested model (default `kimi-k26-fireworks`, overridable via `OZ_RECOMMENDED_MODEL`). |
 | `*` | `/*` | Bearer | *(proxied)* Anything else authenticated falls through to the internal server. |
 
 CORS on `/mcp`: `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, DELETE, OPTIONS`, `Allow-Headers` includes `Content-Type, Authorization, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID`, and `Expose-Headers: Mcp-Session-Id`.
@@ -160,7 +160,7 @@ The internal `@sena-labs/oz-mcp-server` contributes the run/read tools; the prox
 | `oz_run_get` | read-only | Fetch a run's status and output by id. Params: `runId` (required). |
 | `oz_run_list` | read-only | List recent runs, filterable by status (`all` / `active` / `completed` / raw statuses). Params: `status`, `limit`. |
 | `oz_list_environments` | read-only | List the cloud environments available to the account (`oz environment list`). No params. Also exposed as `GET /environments`. |
-| `oz_list_models` | read-only | List the AI model ids available to the account (`oz model list`) and the current default. No params. Also exposed as `GET /models`. |
+| `oz_list_models` | read-only | List the AI model ids available to the account (`oz model list`), the current default, and the recommended model. No params. Also exposed as `GET /models`. |
 | `oz_set_default_model` | write | Set the default Oz model by writing `defaultModel` into the workspace `.warp/warp-bridge.yaml`. Params: `model` (required, e.g. `claude-4-8-opus-max` or `auto`). |
 
 Full JSON `inputSchema`s are returned by `tools/list`.
@@ -186,6 +186,7 @@ Runtime configuration is entirely env-based. Copy `.env.example` to `.env` for l
 | `OZ_TIMEOUT_MS` | no | `300000` | Hard timeout for local runs in ms (passed through). |
 | `OZ_IDLE_TIMEOUT_MS` | no | `90000` | Abort a local run after this long with no CLI output (passed through). |
 | `OZ_LIST_TIMEOUT_MS` | no | `30000` | Hard timeout (ms) for the proxy's own `oz environment list` / `oz model list` calls backing the listing tools and `GET /environments` / `GET /models`. |
+| `OZ_RECOMMENDED_MODEL` | no | `kimi-k26-fireworks` | Model id advertised as `recommended` in the `oz_list_models` tool and `GET /models` output. Override to point clients at a different suggested model. |
 
 > The internal port `3848` is fixed in code and bound to `127.0.0.1` only; it is not configurable and never exposed publicly.
 

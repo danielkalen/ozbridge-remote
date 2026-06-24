@@ -68,6 +68,7 @@ async function createUpstreamClient() {
 
 const OZ_PATH = process.env.OZ_PATH || "oz";
 const OZ_LIST_TIMEOUT_MS = parseInt(process.env.OZ_LIST_TIMEOUT_MS ?? "30000", 10);
+const OZ_RECOMMENDED_MODEL = process.env.OZ_RECOMMENDED_MODEL || "kimi-k26-fireworks";
 
 // Run a read-only `oz` CLI subcommand with JSON output and a bounded timeout.
 // Inherits process.env (so WARP_API_KEY / `oz login` state reach the CLI) and
@@ -139,7 +140,7 @@ async function listOzModels() {
     if (id && !seen.has(id)) { seen.add(id); models.push(id); }
   }
   const current = process.env.OZ_DEFAULT_MODEL || "auto";
-  return { count: models.length, current, models };
+  return { count: models.length, current, recommended: OZ_RECOMMENDED_MODEL, models };
 }
 
 function nonEmptyString(v) {
@@ -171,7 +172,7 @@ const PROXY_TOOL_DESCRIPTORS = {
   oz_list_models: {
     name: "oz_list_models",
     description:
-      "List the AI model ids available to the Warp Oz account (from `oz model list`) and report the current default. Read-only. Pass one of these ids as `model` to `oz_agent_run` / `oz_agent_run_cloud`.",
+      "List the AI model ids available to the Warp Oz account (from `oz model list`), reporting the current default and the recommended model. Read-only. Pass one of these ids as `model` to `oz_agent_run` / `oz_agent_run_cloud`; `recommended` is the suggested pick.",
     inputSchema: { type: "object", properties: {} },
   },
   oz_agent_run: {
