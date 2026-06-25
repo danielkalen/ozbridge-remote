@@ -316,6 +316,34 @@ function missingArgResult(missing) {
   );
 }
 
+// Guidance appended to every successful `oz_agent_run_cloud` response. Cloud runs
+// take a few minutes to complete, and the agent's final result should be fetched
+// with `oz_run_result` (not `oz_run_get`, which returns the full raw payload and
+// truncates output). Callers should either poll or stop and re-fetch manually.
+const OZ_AGENT_RUN_CLOUD_GUIDANCE =
+  "\n\n--- Cloud run guidance ---\n" +
+  "Cloud Oz agent runs typically take a few minutes to complete after launch. " +
+  "To retrieve the agent's final result, call `oz_run_result` with the run id returned above — " +
+  "prefer it over `oz_run_get`, which returns the full raw run payload and truncates output. " +
+  "Either poll `oz_run_result` (or `oz_run_status` for state) at intervals until the run finishes, " +
+  "or stop here and re-run a fetch command manually once the run has had time to complete.";
+
+// Append the cloud-run guidance to a successful `oz_agent_run_cloud` CallToolResult.
+// The tool is forwarded to the upstream oz-mcp-server (which returns the run id); this
+// rewrites the returned content to surface the guidance. Skipped on upstream errors.
+function appendRunCloudGuidance(result) {
+  if (result?.isError) return result;
+  const content = Array.isArray(result?.content) ? result.content : [];
+  if (
+    content.length === 1 &&
+    content[0]?.type === "text" &&
+    typeof content[0].text === "string"
+  ) {
+    return { ...result, content: [{ type: "text", text: content[0].text + OZ_AGENT_RUN_CLOUD_GUIDANCE }] };
+  }
+  return { ...result, content: [...content, { type: "text", text: OZ_AGENT_RUN_CLOUD_GUIDANCE.trim() }] };
+}
+
 // Tools the proxy owns: injected (oz_list_environments), reimplemented in-process
 // (oz_list_models), or re-described with required args + pre-flight validation
 // (oz_agent_run, oz_agent_run_cloud). These override the upstream descriptors.
@@ -350,7 +378,7 @@ const PROXY_TOOL_DESCRIPTORS = {
   oz_agent_run_cloud: {
     name: "oz_agent_run_cloud",
     description:
-      "Launch a cloud Warp Oz agent. CONSUMES WARP CREDITS. Both `environment` (from `oz_list_environments`) and `model` (from `oz_list_models`) are required. Returns the run id immediately; use `oz_run_get` to poll terminal status.",
+      "Launch a cloud Warp Oz agent. CONSUMES WARP CREDITS. Both `environment` (from `oz_list_environments`) and `model` (from `oz_list_models`) are required. Returns the run id immediately; the run itself takes a few minutes to complete. Fetch the agent's final result with `oz_run_result` (preferred) or check state with `oz_run_status` — avoid `oz_run_get` for the result, since it returns the full raw payload and truncates output. The tool response includes a reminder to poll or re-fetch once the run has had time to finish.",
     inputSchema: {
       type: "object",
       required: ["prompt", "model", "environment"],
@@ -372,6 +400,18 @@ const PROXY_TOOL_DESCRIPTORS = {
       properties: {
         runId: { type: "string", description: "The run id to append the follow-up to (the id returned by oz_agent_run_cloud or seen in oz_run_list)." },
         message: { type: "string", description: "The follow-up prompt to send to the run." },
+      },
+    },
+  },
+  oz_run_get: {
+    name: "oz_run_get",
+    description:
+      "Fetch the full raw run payload by id (status + output) via the upstream oz-mcp-server. Prefer `oz_run_result` for the agent's final result (text-only, focused) and `oz_run_status` for a status-only subset — this tool returns the complete payload and may truncate long output. Read-only. The call is forwarded upstream; only the descriptor is overridden here.",
+    inputSchema: {
+      type: "object",
+      required: ["runId"],
+      properties: {
+        runId: { type: "string", description: "The run id to inspect (the id returned by oz_agent_run_cloud or seen in oz_run_list)." },
       },
     },
   },
@@ -414,7 +454,7 @@ const PROXY_TOOL_DESCRIPTORS = {
   oz_run_result: {
     name: "oz_run_result",
     description:
-      "Fetch the assistant's final result for an Oz run by id: takes the trailing run of `role===\"assistant\"` text entries from the transcript and joins them with blank lines; falls back to run.status_message.message, else returns an empty string. Read-only. Also exposed as GET /agent/runs/:runId/result.",
+      "Fetch the assistant's final result for an Oz run by id: takes the trailing run of `role===\"assistant\"` text entries from the transcript and joins them with blank lines; falls back to run.status_message.message, else returns an empty string. Read-only. Preferred over `oz_run_get` for retrieving an agent's final output. Also exposed as GET /agent/runs/:runId/result.",
     inputSchema: {
       type: "object",
       required: ["runId"],
@@ -504,6 +544,12 @@ function createProxyServer(client) {
       if (!nonEmptyString(args.model)) missing.push("model");
       if (!nonEmptyString(args.environment)) missing.push("environment");
       if (missing.length) return missingArgResult(missing);
+      try {
+        const result = await client.callTool(req.params);
+        return appendRunCloudGuidance(result);
+      } catch (err) {
+        return toolTextResult(`Error launching cloud agent: ${err.message}`, true);
+      }
     }
 
     return client.callTool(req.params);
